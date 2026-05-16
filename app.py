@@ -1,87 +1,117 @@
 """
-app.py — Advanced Cloud Video Maker
-====================================
-Features:
-  • Async FFmpeg rendering (background thread) — server never blocks
-  • Live real-time progress bar (FFmpeg pipe parsing)
-  • Drag-and-drop file upload with instant preview
-  • Image thumbnail preview before render
-  • Audio info display (duration, size, format)
-  • 3 quality presets (Fast / Balanced / HQ)
-  • File-type validation (extension + MIME)
-  • ETA + elapsed time display
-  • Auto-download when done
-  • Auto cleanup of temp files
-  • Render history (last 5 jobs)
-
-Deploy: works on localhost + Render.com (PORT env var auto-detected)
+app.py — VideoForge Cloud (Render.com Free-Tier Optimised)
+===========================================================
+Architecture fixes applied:
+  ✓ Audio stream copy (-c:a copy) — zero re-encode, minimal CPU/RAM
+  ✓ Non-blocking progress parsing via readline() + -loglevel warning
+  ✓ Aggressive garbage collection: src files deleted immediately in finally,
+    output MP4 purged after the /download response is streamed
+  ✓ Background reaper thread cleans jobs older than 1 hour
+  ✓ All FFmpeg video flags kept: ultrafast · stillimage · yuv420p · faststart
+  ✓ Single-file deploy: Flask backend + embedded glassmorphic Emerald frontend
 """
 
 import os
-import subprocess
-import uuid
-import json
 import threading
 import time
+import uuid
+import json
+import subprocess
 from pathlib import Path
-from flask import Flask, request, send_file, render_template_string, jsonify
+from flask import Flask, request, jsonify, render_template_string, send_file
 
-# ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 #  APP SETUP
-# ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 150 * 1024 * 1024   # 150 MB
+app.config["MAX_CONTENT_LENGTH"] = 150 * 1024 * 1024   # 150 MB hard cap
 
-TEMP_DIR = Path("/tmp/vm_jobs")
+TEMP_DIR = Path("/tmp/vf_jobs")
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-# In-memory job store  {job_id: dict}
+# In-memory job registry   { job_id: dict }
 jobs: dict[str, dict] = {}
 
 ALLOWED_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
 ALLOWED_AUDIO_EXT = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
 
 QUALITY_PRESETS = {
-    "fast":     {"preset": "ultrafast", "crf": "28", "label": "Fast"},
-    "balanced": {"preset": "fast",      "crf": "23", "label": "Balanced"},
-    "hq":       {"preset": "medium",    "crf": "18", "label": "High Quality"},
+    "fast":     {"preset": "ultrafast", "crf": "28"},
+    "balanced": {"preset": "fast",      "crf": "23"},
+    "hq":       {"preset": "medium",    "crf": "18"},
 }
 
-# ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 #  FFPROBE HELPER
-# ═══════════════════════════════════════════════════════
-def get_audio_info(path: Path) -> dict:
-    """Return duration (s), size (MB), bitrate (kbps) via ffprobe."""
+# ═══════════════════════════════════════════════════════════════════
+def get_audio_duration(path: Path) -> float:
+    """Return audio duration in seconds via ffprobe, or 0 on failure."""
     try:
         result = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json",
-             "-show_format", str(path)],
-            capture_output=True, text=True, timeout=30
+            [
+                "ffprobe", "-v", "quiet",
+                "-print_format", "json",
+                "-show_format",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         fmt = json.loads(result.stdout).get("format", {})
-        return {
-            "duration": float(fmt.get("duration", 0)),
-            "size_mb":  round(int(fmt.get("size", 0)) / 1_048_576, 1),
-            "bitrate":  int(fmt.get("bit_rate", 0)) // 1000,
-        }
+        return float(fmt.get("duration", 0))
     except Exception:
-        return {"duration": 0, "size_mb": 0, "bitrate": 0}
+        return 0.0
 
 
-# ═══════════════════════════════════════════════════════
-#  RENDER WORKER  (background thread)
-# ═══════════════════════════════════════════════════════
-def render_worker(job_id: str, img_path: Path, aud_path: Path,
-                  out_path: Path, quality: str) -> None:
+# ═══════════════════════════════════════════════════════════════════
+#  BACKGROUND REAPER  (cleans stale jobs every 30 minutes)
+# ═══════════════════════════════════════════════════════════════════
+def _reaper():
+    """Delete job directories and registry entries older than 1 hour."""
+    while True:
+        time.sleep(1800)                            # run every 30 min
+        cutoff = time.time() - 3600                 # 1-hour TTL
+        stale  = [jid for jid, j in list(jobs.items()) if j.get("created", 0) < cutoff]
+        for jid in stale:
+            job = jobs.pop(jid, {})
+            out = job.get("output_path")
+            if out:
+                try:
+                    Path(out).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            job_dir = TEMP_DIR / jid
+            try:
+                for f in job_dir.iterdir():
+                    f.unlink(missing_ok=True)
+                job_dir.rmdir()
+            except OSError:
+                pass
+
+threading.Thread(target=_reaper, daemon=True, name="reaper").start()
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  RENDER WORKER  (background thread per job)
+# ═══════════════════════════════════════════════════════════════════
+def render_worker(
+    job_id:   str,
+    img_path: Path,
+    aud_path: Path,
+    out_path: Path,
+    quality:  str,
+) -> None:
     """
-    Runs FFmpeg in a subprocess, reads live progress from stdout,
-    updates jobs[job_id] in-place.
+    Runs FFmpeg with:
+      • -c:a copy        → zero audio re-encode (critical for 512 MB RAM)
+      • -loglevel warning → stderr warnings visible; stdout kept for -progress
+      • readline()       → non-blocking, line-by-line progress parsing; no deadlock
+    Cleans up source files immediately in finally regardless of outcome.
     """
     job = jobs[job_id]
 
-    # Get audio info for progress calculation
-    info             = get_audio_info(aud_path)
-    duration         = info["duration"]
+    duration         = get_audio_duration(aud_path)
     job["duration"]  = duration
     job["status"]    = "rendering"
     job["start_time"] = time.time()
@@ -90,48 +120,65 @@ def render_worker(job_id: str, img_path: Path, aud_path: Path,
 
     command = [
         "ffmpeg",
-        "-loop", "1", "-framerate", "1",
-        "-i", str(img_path),
+        # Input: static image looped at 1 fps (minimal decode cost)
+        "-loop", "1", "-framerate", "1", "-i", str(img_path),
+        # Input: audio (stream-copied — no decode/re-encode)
         "-i", str(aud_path),
+        # Video codec
         "-c:v", "libx264",
         "-preset", cfg["preset"],
         "-tune", "stillimage",
         "-crf", cfg["crf"],
-        "-c:a", "aac", "-b:a", "192k",      # re-encode for max compatibility
-        "-pix_fmt", "yuv420p",               # required for WhatsApp/social media
-        "-movflags", "+faststart",           # web-optimized MP4
+        "-pix_fmt", "yuv420p",
+        # ─── KEY OPTIMISATION: copy audio stream, skip re-encode ───
+        "-c:a", "copy",
+        # Web-optimised MP4 (moov atom at front)
+        "-movflags", "+faststart",
+        # Stop when the shorter stream ends (audio drives length)
         "-shortest",
-        "-progress", "pipe:1",              # live progress to stdout
-        "-loglevel", "quiet",
+        # Live progress to stdout; warnings/errors to stderr
+        "-progress", "pipe:1",
+        "-loglevel", "warning",
         str(out_path), "-y",
     ]
 
+    proc = None
     try:
         proc = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            bufsize=1,
+            bufsize=1,          # line-buffered
         )
 
-        # Parse progress lines from FFmpeg
-        for line in proc.stdout:
+        # ── Non-blocking readline() progress loop ──────────────────
+        # FFmpeg writes "key=value\n" lines to stdout when -progress pipe:1
+        # is used. readline() blocks only until a newline arrives — safe.
+        while True:
+            line = proc.stdout.readline()
+            if line == "" and proc.poll() is not None:
+                break                               # process exited
+            if not line:
+                continue
+
             key, _, val = line.strip().partition("=")
+
             if key == "out_time_ms" and duration > 0:
                 try:
-                    secs = int(val) / 1_000_000
-                    pct  = min(99, int(secs / duration * 100))
+                    secs  = int(val) / 1_000_000
+                    pct   = min(99, int(secs / duration * 100))
                     job["progress"] = pct
                     elapsed = time.time() - job["start_time"]
                     if pct > 1:
                         job["eta"] = int((elapsed / pct) * (100 - pct))
                 except (ValueError, ZeroDivisionError):
                     pass
-            elif key == "progress" and val == "end":
+
+            elif key == "progress" and val.strip() == "end":
                 job["progress"] = 100
 
-        proc.wait(timeout=7200)   # 2-hour hard cap
+        proc.wait(timeout=7200)                     # 2-hour absolute cap
 
         if proc.returncode == 0 and out_path.exists():
             job["status"]      = "done"
@@ -140,32 +187,41 @@ def render_worker(job_id: str, img_path: Path, aud_path: Path,
             job["file_size"]   = round(out_path.stat().st_size / 1_048_576, 1)
             job["eta"]         = 0
         else:
-            stderr_tail = proc.stderr.read(600) if proc.stderr else ""
+            stderr_tail = proc.stderr.read(800) if proc.stderr else ""
             job["status"] = "error"
-            job["error"]  = f"FFmpeg returned code {proc.returncode}. {stderr_tail}"
+            job["error"]  = (
+                f"FFmpeg exited with code {proc.returncode}. {stderr_tail.strip()}"
+            )
 
     except subprocess.TimeoutExpired:
-        proc.kill()
+        if proc:
+            proc.kill()
         job["status"] = "error"
-        job["error"]  = "Render timeout (>2 hours). Chota audio use karein."
+        job["error"]  = "Render timeout (> 2 hours). Please use a shorter audio file."
+
     except FileNotFoundError:
         job["status"] = "error"
-        job["error"]  = "FFmpeg nahi mila. Server pe FFmpeg install karo."
-    except Exception as e:
+        job["error"]  = "FFmpeg not found on server. Please contact support."
+
+    except Exception as exc:
         job["status"] = "error"
-        job["error"]  = str(e)
+        job["error"]  = str(exc)
+
     finally:
-        for f in (img_path, aud_path):
+        # ── Immediately delete uploaded source files ────────────────
+        # Done here regardless of success/failure to free disk space
+        # on Render's ephemeral filesystem as soon as possible.
+        for src in (img_path, aud_path):
             try:
-                f.unlink(missing_ok=True)
+                os.remove(src)
             except OSError:
                 pass
 
 
-# ═══════════════════════════════════════════════════════
-#  HTML / CSS / JS  (single-file embedded)
-# ═══════════════════════════════════════════════════════
-HTML_TEMPLATE = r"""<!DOCTYPE html>
+# ═══════════════════════════════════════════════════════════════════
+#  EMBEDDED FRONTEND  (glassmorphic, Emerald theme)
+# ═══════════════════════════════════════════════════════════════════
+HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -174,27 +230,29 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Sora:wght@300;400;600;700&display=swap" rel="stylesheet">
 <style>
-/* ── Reset & Base ─────────────────────────────── */
+/* ── Reset ───────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
-  --bg:      #080c08;
-  --surface: #0f160f;
-  --card:    #141e14;
-  --border:  #1e2e1e;
-  --green:   #22c55e;
-  --green2:  #4ade80;
-  --dim:     #374137;
-  --text:    #e2f0e2;
-  --muted:   #6b7a6b;
-  --danger:  #f87171;
-  --radius:  14px;
-  --mono: 'Space Mono', monospace;
-  --sans: 'Sora', sans-serif;
+  --bg:       #060b06;
+  --surface:  #0c130c;
+  --card:     #101a10;
+  --glass:    rgba(16,26,16,.65);
+  --border:   #1a2e1a;
+  --border2:  #243424;
+  --green:    #22c55e;
+  --green2:   #4ade80;
+  --green3:   #86efac;
+  --dim:      #2d422d;
+  --text:     #dff0df;
+  --muted:    #617761;
+  --danger:   #f87171;
+  --r:        16px;
+  --mono:     'Space Mono', monospace;
+  --sans:     'Sora', sans-serif;
 }
 
 html, body { height: 100%; }
-
 body {
   font-family: var(--sans);
   background: var(--bg);
@@ -203,381 +261,404 @@ body {
   overflow-x: hidden;
 }
 
-/* ── Animated background grid ─────────────────── */
+/* ── Animated grid background ────────────────────────── */
 body::before {
   content: '';
   position: fixed; inset: 0; z-index: 0;
   background-image:
-    linear-gradient(rgba(34,197,94,.04) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(34,197,94,.04) 1px, transparent 1px);
-  background-size: 48px 48px;
-  animation: gridDrift 20s linear infinite;
+    linear-gradient(rgba(34,197,94,.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(34,197,94,.035) 1px, transparent 1px);
+  background-size: 52px 52px;
+  animation: gridDrift 24s linear infinite;
   pointer-events: none;
 }
-@keyframes gridDrift { to { background-position: 48px 48px; } }
+@keyframes gridDrift { to { background-position: 52px 52px; } }
 
-/* Radial glow */
+/* Radial ambient glow */
 body::after {
   content: '';
   position: fixed;
-  top: -20%; left: 50%; transform: translateX(-50%);
-  width: 800px; height: 500px;
-  background: radial-gradient(ellipse, rgba(34,197,94,.12) 0%, transparent 70%);
+  top: -15%; left: 50%; transform: translateX(-50%);
+  width: 900px; height: 560px;
+  background: radial-gradient(ellipse, rgba(34,197,94,.10) 0%, transparent 68%);
   pointer-events: none; z-index: 0;
 }
 
-/* ── Layout ───────────────────────────────────── */
+/* ── Layout ──────────────────────────────────────────── */
 .wrapper {
   position: relative; z-index: 1;
-  max-width: 680px;
+  max-width: 660px;
   margin: 0 auto;
-  padding: 40px 20px 60px;
+  padding: 44px 20px 64px;
 }
 
-/* ── Header ───────────────────────────────────── */
-header {
-  text-align: center;
-  margin-bottom: 40px;
-}
-.logo-badge {
+/* ── Header ──────────────────────────────────────────── */
+header { text-align: center; margin-bottom: 42px; }
+
+.badge {
   display: inline-flex; align-items: center; gap: 8px;
-  background: rgba(34,197,94,.1);
-  border: 1px solid rgba(34,197,94,.25);
+  background: rgba(34,197,94,.08);
+  border: 1px solid rgba(34,197,94,.22);
   border-radius: 100px;
-  padding: 6px 16px;
+  padding: 6px 18px;
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 10px;
   color: var(--green2);
-  letter-spacing: 2px;
+  letter-spacing: 2.5px;
   text-transform: uppercase;
-  margin-bottom: 18px;
+  margin-bottom: 20px;
 }
-.logo-badge span { width: 6px; height: 6px; background: var(--green); border-radius: 50%; animation: pulse 2s ease-in-out infinite; }
-@keyframes pulse { 0%,100%{ opacity:1; transform:scale(1); } 50%{ opacity:.4; transform:scale(.6); } }
+.badge-dot {
+  width: 7px; height: 7px;
+  background: var(--green);
+  border-radius: 50%;
+  animation: blink 2.2s ease-in-out infinite;
+}
+@keyframes blink { 0%,100%{ opacity:1; } 50%{ opacity:.3; } }
 
 h1 {
-  font-size: clamp(28px, 5vw, 42px);
+  font-size: clamp(26px, 5.5vw, 44px);
   font-weight: 700;
-  letter-spacing: -1px;
+  letter-spacing: -1.5px;
   color: #fff;
-  line-height: 1.1;
+  line-height: 1.08;
 }
 h1 em {
   font-style: normal;
-  background: linear-gradient(135deg, var(--green) 0%, var(--green2) 100%);
+  background: linear-gradient(130deg, var(--green) 0%, var(--green2) 55%, var(--green3) 100%);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
 }
 .subtitle {
-  margin-top: 10px;
+  margin-top: 12px;
   color: var(--muted);
   font-size: 14px;
+  line-height: 1.6;
 }
 
-/* ── Cards ────────────────────────────────────── */
+/* ── Glassmorphic card ───────────────────────────────── */
 .card {
-  background: var(--card);
+  background: var(--glass);
+  backdrop-filter: blur(18px) saturate(140%);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
   border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border-radius: var(--r);
   padding: 24px;
-  margin-bottom: 16px;
-  transition: border-color .2s;
+  margin-bottom: 14px;
+  transition: border-color .2s, box-shadow .2s;
 }
-.card:hover { border-color: var(--dim); }
+.card:hover {
+  border-color: var(--border2);
+  box-shadow: 0 0 0 1px rgba(34,197,94,.06) inset, 0 8px 32px rgba(0,0,0,.35);
+}
 
 .card-label {
-  font-size: 11px;
+  font-size: 10px;
   font-family: var(--mono);
   color: var(--green);
-  letter-spacing: 2px;
+  letter-spacing: 2.5px;
   text-transform: uppercase;
-  margin-bottom: 14px;
-  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 16px;
+  display: flex; align-items: center; gap: 10px;
 }
 .card-label::after { content: ''; flex: 1; height: 1px; background: var(--border); }
 
-/* ── Drop zone ────────────────────────────────── */
+/* ── Drop zone ───────────────────────────────────────── */
 .drop-zone {
   border: 1.5px dashed var(--dim);
   border-radius: 10px;
-  padding: 28px 20px;
+  padding: 30px 20px;
   text-align: center;
   cursor: pointer;
   transition: all .2s;
   position: relative;
   overflow: hidden;
+  user-select: none;
 }
-.drop-zone:hover,
-.drop-zone.drag-over {
+.drop-zone:hover, .drop-zone.drag-over {
   border-color: var(--green);
-  background: rgba(34,197,94,.05);
+  background: rgba(34,197,94,.06);
+  box-shadow: 0 0 24px rgba(34,197,94,.08) inset;
 }
 .drop-zone input[type="file"] {
-  position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
+  position: absolute; inset: 0;
+  opacity: 0; cursor: pointer;
+  width: 100%; height: 100%;
 }
-.drop-icon { font-size: 28px; margin-bottom: 8px; }
-.drop-text { color: var(--muted); font-size: 14px; }
-.drop-text strong { color: var(--green2); }
-.drop-hint { font-size: 11px; color: var(--dim); margin-top: 4px; font-family: var(--mono); }
+.drop-icon { font-size: 30px; margin-bottom: 8px; }
+.drop-text { color: var(--muted); font-size: 13.5px; }
+.drop-text strong { color: var(--green2); font-weight: 600; }
+.drop-hint { font-size: 11px; color: var(--dim); margin-top: 5px; font-family: var(--mono); letter-spacing: .5px; }
 
-/* ── Image Preview ────────────────────────────── */
+/* ── Image preview ───────────────────────────────────── */
 #imgPreview {
   display: none;
   margin-top: 14px;
-  border-radius: 8px;
+  border-radius: 10px;
   overflow: hidden;
   position: relative;
+  border: 1px solid var(--border2);
 }
 #imgPreview img {
-  width: 100%; max-height: 180px; object-fit: cover;
-  display: block;
+  width: 100%; max-height: 190px; object-fit: cover; display: block;
 }
 #imgPreview .overlay {
   position: absolute; bottom: 0; left: 0; right: 0;
-  background: linear-gradient(transparent, rgba(0,0,0,.7));
-  padding: 10px 12px 8px;
-  font-size: 12px; color: #aaa; font-family: var(--mono);
+  background: linear-gradient(transparent, rgba(0,0,0,.72));
+  padding: 12px 14px 10px;
+  font-size: 11.5px; color: #aaa; font-family: var(--mono);
 }
 
-/* ── Audio Info ───────────────────────────────── */
+/* ── Audio pill ──────────────────────────────────────── */
 #audioInfo {
   display: none;
   margin-top: 14px;
-  background: var(--surface);
-  border-radius: 8px;
-  padding: 12px 16px;
+  background: rgba(6,11,6,.7);
+  border: 1px solid var(--border2);
+  border-radius: 10px;
+  padding: 14px 16px;
+}
+.aud-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 8px;
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 11.5px;
 }
-.audio-row { display: flex; justify-content: space-between; align-items: center; }
-.audio-row + .audio-row { margin-top: 6px; }
-.audio-row span:first-child { color: var(--muted); }
-.audio-row span:last-child  { color: var(--green2); }
-.audio-bar {
-  margin-top: 10px;
-  height: 3px;
+.aud-cell { display: flex; flex-direction: column; gap: 3px; }
+.aud-cell .lbl { color: var(--muted); font-size: 10px; letter-spacing: 1px; text-transform: uppercase; }
+.aud-cell .val { color: var(--green2); font-weight: 700; word-break: break-all; }
+.aud-wave {
+  margin-top: 12px; height: 3px;
   background: var(--border);
-  border-radius: 99px;
-  overflow: hidden;
+  border-radius: 99px; overflow: hidden;
 }
-.audio-bar-fill {
+.aud-wave-fill {
   height: 100%;
   background: linear-gradient(90deg, var(--green), var(--green2));
   border-radius: 99px;
-  animation: shimmer 2s ease-in-out infinite;
-  width: 60%;
+  animation: waveFlow 2.5s ease-in-out infinite;
+  width: 55%;
 }
-@keyframes shimmer { 0%,100%{ opacity:.6; } 50%{ opacity:1; } }
+@keyframes waveFlow { 0%,100%{ opacity:.5; transform:scaleX(1); } 50%{ opacity:1; transform:scaleX(1.04); } }
 
-/* ── Quality Selector ─────────────────────────── */
-.quality-grid {
+/* ── Quality selector ────────────────────────────────── */
+.q-grid {
   display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;
 }
 .q-btn {
-  background: var(--surface);
+  background: rgba(6,11,6,.8);
   border: 1.5px solid var(--border);
-  border-radius: 8px;
-  padding: 12px 8px;
+  border-radius: 10px;
+  padding: 14px 8px;
   cursor: pointer;
   text-align: center;
-  transition: all .15s;
+  transition: all .18s;
   font-family: var(--sans);
 }
-.q-btn:hover { border-color: var(--dim); }
+.q-btn:hover { border-color: var(--dim); background: rgba(34,197,94,.04); }
 .q-btn.active {
   border-color: var(--green);
   background: rgba(34,197,94,.1);
+  box-shadow: 0 0 18px rgba(34,197,94,.12) inset;
 }
-.q-icon { font-size: 20px; margin-bottom: 4px; }
+.q-icon { font-size: 22px; margin-bottom: 5px; }
 .q-name { font-size: 13px; font-weight: 600; color: var(--text); }
 .q-desc { font-size: 11px; color: var(--muted); margin-top: 2px; font-family: var(--mono); }
 input[name="quality"] { display: none; }
 
-/* ── Render Button ────────────────────────────── */
+/* ── Render button ───────────────────────────────────── */
 #renderBtn {
-  width: 100%; padding: 16px;
-  background: linear-gradient(135deg, #16a34a 0%, #22c55e 100%);
-  border: none; border-radius: var(--radius);
+  width: 100%; padding: 17px;
+  background: linear-gradient(135deg, #15803d 0%, #22c55e 100%);
+  border: none; border-radius: var(--r);
   color: #fff;
   font-family: var(--sans);
   font-size: 16px; font-weight: 700;
-  cursor: pointer;
-  letter-spacing: .5px;
-  transition: all .2s;
+  cursor: pointer; letter-spacing: .4px;
+  transition: all .22s;
   position: relative; overflow: hidden;
-  margin-top: 8px;
+  margin-top: 10px;
+  box-shadow: 0 4px 20px rgba(34,197,94,.2);
 }
-#renderBtn::after {
+#renderBtn::before {
   content: '';
   position: absolute; inset: 0;
-  background: linear-gradient(135deg, transparent 30%, rgba(255,255,255,.15) 50%, transparent 70%);
-  transform: translateX(-100%);
-  transition: transform .4s;
+  background: linear-gradient(135deg, transparent 25%, rgba(255,255,255,.14) 50%, transparent 75%);
+  transform: translateX(-120%);
+  transition: transform .5s;
 }
-#renderBtn:hover::after { transform: translateX(100%); }
-#renderBtn:hover { transform: translateY(-1px); box-shadow: 0 8px 24px rgba(34,197,94,.35); }
-#renderBtn:active { transform: translateY(0); }
+#renderBtn:hover::before { transform: translateX(120%); }
+#renderBtn:hover { transform: translateY(-2px); box-shadow: 0 10px 28px rgba(34,197,94,.38); }
+#renderBtn:active { transform: translateY(0); box-shadow: 0 4px 16px rgba(34,197,94,.2); }
 #renderBtn:disabled {
-  background: var(--dim); cursor: not-allowed; transform: none; box-shadow: none;
+  background: var(--dim); cursor: not-allowed;
+  transform: none; box-shadow: none;
 }
 
-/* ── Progress Section ─────────────────────────── */
+/* ── Progress card ───────────────────────────────────── */
 #progressSection {
   display: none;
-  background: var(--card);
+  background: var(--glass);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
   border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 24px;
+  border-radius: var(--r);
+  padding: 26px;
   margin-top: 16px;
 }
-
-.prog-header {
+.prog-row {
   display: flex; justify-content: space-between; align-items: center;
-  margin-bottom: 16px;
+  margin-bottom: 18px;
 }
 .prog-title { font-weight: 600; font-size: 15px; }
 .prog-pct {
   font-family: var(--mono);
-  font-size: 22px; font-weight: 700;
+  font-size: 26px; font-weight: 700;
   color: var(--green2);
+  letter-spacing: -1px;
 }
-
-.prog-bar-track {
-  height: 8px; background: var(--surface);
+.prog-track {
+  height: 8px;
+  background: var(--surface);
   border-radius: 99px; overflow: hidden;
+  border: 1px solid var(--border);
 }
-.prog-bar-fill {
-  height: 100%;
-  border-radius: 99px;
-  background: linear-gradient(90deg, #16a34a, var(--green2));
-  transition: width .5s ease;
+.prog-fill {
+  height: 100%; border-radius: 99px;
+  background: linear-gradient(90deg, #15803d, var(--green2));
+  transition: width .6s cubic-bezier(.4,0,.2,1);
   width: 0%;
   position: relative;
 }
-.prog-bar-fill::after {
+.prog-fill::after {
   content: '';
-  position: absolute; top: 0; right: 0; bottom: 0; width: 40px;
-  background: linear-gradient(90deg, transparent, rgba(255,255,255,.35));
-  animation: sweep 1.2s ease-in-out infinite;
+  position: absolute; top: 0; right: 0; bottom: 0; width: 60px;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,.3));
+  animation: sheen 1.4s ease-in-out infinite;
 }
-@keyframes sweep { 0%{ opacity:0; } 50%{ opacity:1; } 100%{ opacity:0; } }
-
+@keyframes sheen { 0%,100%{ opacity:0; } 50%{ opacity:1; } }
 .prog-meta {
   display: flex; justify-content: space-between;
   margin-top: 12px;
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--muted);
+  font-family: var(--mono); font-size: 11.5px; color: var(--muted);
 }
-
 .prog-status {
   margin-top: 12px;
-  padding: 8px 12px;
-  background: var(--surface);
-  border-radius: 6px;
-  font-size: 13px; color: var(--muted);
+  padding: 10px 14px;
+  background: rgba(6,11,6,.8);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 12.5px; color: var(--muted);
   font-family: var(--mono);
-  min-height: 36px;
+  min-height: 38px;
 }
 
-/* ── Download Section ─────────────────────────── */
+/* ── Download card ───────────────────────────────────── */
 #downloadSection {
   display: none;
-  background: rgba(34,197,94,.08);
-  border: 1px solid rgba(34,197,94,.3);
-  border-radius: var(--radius);
-  padding: 24px;
+  background: rgba(34,197,94,.07);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  border: 1px solid rgba(34,197,94,.28);
+  border-radius: var(--r);
+  padding: 30px 24px;
   text-align: center;
   margin-top: 16px;
-  animation: fadeSlide .4s ease;
+  animation: fadeUp .42s cubic-bezier(.4,0,.2,1);
 }
-@keyframes fadeSlide { from{ opacity:0; transform:translateY(8px); } to{ opacity:1; transform:translateY(0); } }
-
-.done-icon { font-size: 40px; margin-bottom: 10px; }
-.done-title { font-size: 18px; font-weight: 700; color: #fff; margin-bottom: 4px; }
-.done-meta { font-size: 13px; color: var(--muted); font-family: var(--mono); margin-bottom: 18px; }
+@keyframes fadeUp { from{ opacity:0; transform:translateY(10px); } to{ opacity:1; transform:translateY(0); } }
+.done-icon { font-size: 44px; margin-bottom: 12px; }
+.done-title { font-size: 20px; font-weight: 700; color: #fff; margin-bottom: 4px; }
+.done-meta { font-size: 12.5px; color: var(--muted); font-family: var(--mono); margin-bottom: 22px; }
 
 #downloadBtn {
-  display: inline-flex; align-items: center; gap: 8px;
+  display: inline-flex; align-items: center; gap: 10px;
   background: var(--green);
   color: #000;
   font-weight: 700; font-size: 15px;
-  padding: 13px 28px;
+  padding: 14px 30px;
   border-radius: 100px;
   text-decoration: none;
   transition: all .2s;
+  box-shadow: 0 4px 18px rgba(34,197,94,.35);
 }
-#downloadBtn:hover { background: var(--green2); transform: translateY(-2px); box-shadow: 0 6px 20px rgba(34,197,94,.4); }
+#downloadBtn:hover {
+  background: var(--green2);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 28px rgba(34,197,94,.45);
+}
 
-.new-render-btn {
-  display: block;
-  margin-top: 14px;
+/* ── Error card ──────────────────────────────────────── */
+#errorSection {
+  display: none;
+  background: rgba(248,113,113,.07);
+  border: 1px solid rgba(248,113,113,.28);
+  border-radius: var(--r);
+  padding: 22px;
+  margin-top: 16px;
+  animation: fadeUp .4s ease;
+}
+.err-title { font-weight: 600; color: var(--danger); margin-bottom: 8px; font-size: 15px; }
+.err-msg { font-family: var(--mono); font-size: 12px; color: #fca5a5; word-break: break-all; line-height: 1.7; }
+
+/* ── Shared reset link ───────────────────────────────── */
+.reset-link {
+  display: block; margin-top: 16px;
   background: none; border: none;
   color: var(--muted); font-size: 13px; cursor: pointer;
   font-family: var(--sans);
   text-decoration: underline;
+  text-underline-offset: 3px;
 }
-.new-render-btn:hover { color: var(--text); }
+.reset-link:hover { color: var(--text); }
 
-/* ── Error ────────────────────────────────────── */
-#errorSection {
-  display: none;
-  background: rgba(248,113,113,.08);
-  border: 1px solid rgba(248,113,113,.3);
-  border-radius: var(--radius);
-  padding: 20px;
-  margin-top: 16px;
-}
-.err-title { font-weight: 600; color: var(--danger); margin-bottom: 6px; }
-.err-msg { font-family: var(--mono); font-size: 12px; color: #fca5a5; word-break: break-all; }
-
-/* ── Toast ────────────────────────────────────── */
+/* ── Toast ───────────────────────────────────────────── */
 .toast {
-  position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
-  background: var(--card); border: 1px solid var(--border);
-  padding: 10px 20px; border-radius: 100px;
+  position: fixed; bottom: 28px; left: 50%; transform: translateX(-50%);
+  background: var(--card); border: 1px solid var(--border2);
+  padding: 11px 22px; border-radius: 100px;
   font-size: 13px; color: var(--text);
-  pointer-events: none; opacity: 0;
-  transition: opacity .3s;
-  z-index: 100;
+  pointer-events: none; opacity: 0; transition: opacity .28s;
+  z-index: 999;
 }
 .toast.show { opacity: 1; }
 
-/* ── Footer ───────────────────────────────────── */
+/* ── Footer ──────────────────────────────────────────── */
 footer {
   text-align: center;
-  margin-top: 40px;
-  font-size: 12px;
+  margin-top: 48px;
+  font-size: 11.5px;
   color: var(--dim);
   font-family: var(--mono);
+  letter-spacing: .5px;
 }
 </style>
 </head>
 <body>
-
 <div class="wrapper">
 
-  <!-- Header -->
+  <!-- ════════════ HEADER ════════════ -->
   <header>
-    <div class="logo-badge"><span></span> VideoForge Cloud</div>
+    <div class="badge"><span class="badge-dot"></span>VideoForge Cloud</div>
     <h1>Image + Audio<br>= <em>Video, Instant.</em></h1>
-    <p class="subtitle">Drop your files below. Server renders it with FFmpeg.</p>
+    <p class="subtitle">Drop your files below. FFmpeg renders it on the server — no re-encoding, no waiting.</p>
   </header>
 
-  <!-- ── UPLOAD FORM ─────────────────────────── -->
+  <!-- ════════════ FORM ════════════ -->
   <div id="formSection">
 
     <!-- Cover Image -->
     <div class="card">
       <div class="card-label">01 — Cover Image</div>
       <div class="drop-zone" id="imgDrop">
-        <input type="file" id="imgInput" name="image" accept=".jpg,.jpeg,.png,.webp,.bmp" required>
+        <input type="file" id="imgInput" accept=".jpg,.jpeg,.png,.webp,.bmp">
         <div class="drop-icon">🖼️</div>
         <div class="drop-text"><strong>Click or drag</strong> an image here</div>
         <div class="drop-hint">JPG · PNG · WEBP · BMP</div>
       </div>
       <div id="imgPreview">
-        <img id="imgThumb" src="" alt="Preview">
+        <img id="imgThumb" src="" alt="">
         <div class="overlay" id="imgMeta">—</div>
       </div>
     </div>
@@ -586,61 +667,57 @@ footer {
     <div class="card">
       <div class="card-label">02 — Audio Track</div>
       <div class="drop-zone" id="audDrop">
-        <input type="file" id="audInput" name="audio" accept=".mp3,.wav,.m4a,.aac,.ogg,.flac" required>
+        <input type="file" id="audInput" accept=".mp3,.wav,.m4a,.aac,.ogg,.flac">
         <div class="drop-icon">🎵</div>
         <div class="drop-text"><strong>Click or drag</strong> audio here</div>
-        <div class="drop-hint">MP3 · WAV · M4A · AAC · OGG · FLAC &nbsp;|&nbsp; Up to 150 MB</div>
+        <div class="drop-hint">MP3 · WAV · M4A · AAC · OGG · FLAC &nbsp;|&nbsp; Max 150 MB</div>
       </div>
       <div id="audioInfo">
-        <div class="audio-row">
-          <span>File</span><span id="audName">—</span>
+        <div class="aud-grid">
+          <div class="aud-cell"><span class="lbl">File</span><span class="val" id="audName">—</span></div>
+          <div class="aud-cell"><span class="lbl">Size</span><span class="val" id="audSize">—</span></div>
+          <div class="aud-cell"><span class="lbl">Format</span><span class="val" id="audFmt">—</span></div>
         </div>
-        <div class="audio-row">
-          <span>Size</span><span id="audSize">—</span>
-        </div>
-        <div class="audio-row">
-          <span>Format</span><span id="audFormat">—</span>
-        </div>
-        <div class="audio-bar"><div class="audio-bar-fill"></div></div>
+        <div class="aud-wave"><div class="aud-wave-fill"></div></div>
       </div>
     </div>
 
     <!-- Quality -->
     <div class="card">
       <div class="card-label">03 — Output Quality</div>
-      <div class="quality-grid">
-        <label class="q-btn" onclick="setQuality('fast')">
+      <div class="q-grid">
+        <label class="q-btn" id="qFast" onclick="setQuality('fast',this)">
           <input type="radio" name="quality" value="fast">
           <div class="q-icon">⚡</div>
           <div class="q-name">Fast</div>
           <div class="q-desc">ultrafast</div>
         </label>
-        <label class="q-btn active" onclick="setQuality('balanced')">
+        <label class="q-btn active" id="qBalanced" onclick="setQuality('balanced',this)">
           <input type="radio" name="quality" value="balanced" checked>
           <div class="q-icon">⚖️</div>
           <div class="q-name">Balanced</div>
           <div class="q-desc">recommended</div>
         </label>
-        <label class="q-btn" onclick="setQuality('hq')">
+        <label class="q-btn" id="qHq" onclick="setQuality('hq',this)">
           <input type="radio" name="quality" value="hq">
           <div class="q-icon">💎</div>
-          <div class="q-name">HQ</div>
-          <div class="q-desc">best quality</div>
+          <div class="q-name">High Quality</div>
+          <div class="q-desc">best output</div>
         </label>
       </div>
     </div>
 
     <button id="renderBtn" onclick="startRender()">⚡ Render Video</button>
-  </div>
+  </div><!-- /formSection -->
 
-  <!-- ── PROGRESS ────────────────────────────── -->
+  <!-- ════════════ PROGRESS ════════════ -->
   <div id="progressSection">
-    <div class="prog-header">
+    <div class="prog-row">
       <span class="prog-title">🎬 Rendering…</span>
       <span class="prog-pct" id="progPct">0%</span>
     </div>
-    <div class="prog-bar-track">
-      <div class="prog-bar-fill" id="progBar"></div>
+    <div class="prog-track">
+      <div class="prog-fill" id="progBar"></div>
     </div>
     <div class="prog-meta">
       <span id="progElapsed">0s elapsed</span>
@@ -649,47 +726,48 @@ footer {
     <div class="prog-status" id="progStatus">Queued…</div>
   </div>
 
-  <!-- ── DOWNLOAD ────────────────────────────── -->
+  <!-- ════════════ DOWNLOAD ════════════ -->
   <div id="downloadSection">
     <div class="done-icon">✅</div>
     <div class="done-title">Video Ready!</div>
     <div class="done-meta" id="doneMeta">—</div>
     <a id="downloadBtn" href="#" download>⬇️ Download MP4</a>
-    <button class="new-render-btn" onclick="resetUI()">Make another video</button>
+    <button class="reset-link" onclick="resetUI()">Make another video</button>
   </div>
 
-  <!-- ── ERROR ──────────────────────────────── -->
+  <!-- ════════════ ERROR ════════════ -->
   <div id="errorSection">
     <div class="err-title">❌ Render Failed</div>
     <div class="err-msg" id="errMsg">Unknown error</div>
-    <button class="new-render-btn" onclick="resetUI()">Try again</button>
+    <button class="reset-link" onclick="resetUI()">Try again</button>
   </div>
 
 </div><!-- /wrapper -->
 
 <div class="toast" id="toast"></div>
-<footer>VideoForge &nbsp;·&nbsp; FFmpeg-powered &nbsp;·&nbsp; Cloud Render</footer>
+<footer>VideoForge &nbsp;·&nbsp; FFmpeg-powered &nbsp;·&nbsp; -c:a copy &nbsp;·&nbsp; Render.com Free Tier</footer>
 
 <script>
-// ── State ─────────────────────────────────────────
-let activeJobId = null;
-let pollTimer   = null;
-let renderStart = null;
+// ── State ──────────────────────────────────────────────────────────
+let activeJobId    = null;
+let pollTimer      = null;
+let renderStart    = null;
 let selectedQuality = 'balanced';
 
-// ── Quality selector ──────────────────────────────
-function setQuality(q) {
+// ── Quality selector ───────────────────────────────────────────────
+function setQuality(q, el) {
   selectedQuality = q;
   document.querySelectorAll('.q-btn').forEach(b => b.classList.remove('active'));
-  event.currentTarget.classList.add('active');
+  el.classList.add('active');
 }
 
-// ── Drag-and-drop helpers ─────────────────────────
+// ── Generic drag-and-drop setup ────────────────────────────────────
 function setupDrop(zoneId, inputId, onFile) {
   const zone  = document.getElementById(zoneId);
   const input = document.getElementById(inputId);
+
   zone.addEventListener('dragover',  e => { e.preventDefault(); zone.classList.add('drag-over'); });
-  zone.addEventListener('dragleave', () => zone.classList.remove('drag-over'));
+  zone.addEventListener('dragleave', ()=> zone.classList.remove('drag-over'));
   zone.addEventListener('drop', e => {
     e.preventDefault();
     zone.classList.remove('drag-over');
@@ -699,56 +777,56 @@ function setupDrop(zoneId, inputId, onFile) {
   input.addEventListener('change', () => { if (input.files[0]) onFile(input.files[0]); });
 }
 
-// ── Image preview ─────────────────────────────────
+// ── Image: live thumbnail ──────────────────────────────────────────
 setupDrop('imgDrop', 'imgInput', file => {
   const reader = new FileReader();
   reader.onload = e => {
     document.getElementById('imgThumb').src = e.target.result;
     document.getElementById('imgMeta').textContent =
-      `${file.name}  ·  ${(file.size/1048576).toFixed(1)} MB`;
+      file.name + '  ·  ' + (file.size / 1048576).toFixed(1) + ' MB';
     document.getElementById('imgPreview').style.display = 'block';
   };
   reader.readAsDataURL(file);
 });
 
-// ── Audio info ────────────────────────────────────
+// ── Audio: metadata pill ───────────────────────────────────────────
 setupDrop('audDrop', 'audInput', file => {
-  document.getElementById('audName').textContent   = file.name.length > 28
-    ? file.name.slice(0,25) + '...' : file.name;
-  document.getElementById('audSize').textContent   = (file.size/1048576).toFixed(1) + ' MB';
-  document.getElementById('audFormat').textContent = file.name.split('.').pop().toUpperCase();
+  const nameEl = document.getElementById('audName');
+  nameEl.textContent = file.name.length > 20
+    ? file.name.slice(0, 18) + '…'
+    : file.name;
+  document.getElementById('audSize').textContent = (file.size / 1048576).toFixed(1) + ' MB';
+  document.getElementById('audFmt').textContent  = file.name.split('.').pop().toUpperCase();
   document.getElementById('audioInfo').style.display = 'block';
 });
 
-// ── Start render ──────────────────────────────────
+// ── Start render ───────────────────────────────────────────────────
 async function startRender() {
   const imgFile = document.getElementById('imgInput').files[0];
   const audFile = document.getElementById('audInput').files[0];
 
-  if (!imgFile) { showToast('Cover image select karo'); return; }
-  if (!audFile) { showToast('Audio file select karo');  return; }
+  if (!imgFile) { showToast('⚠️ Please select a cover image'); return; }
+  if (!audFile) { showToast('⚠️ Please select an audio file'); return; }
 
-  const formData = new FormData();
-  formData.append('image',   imgFile);
-  formData.append('audio',   audFile);
-  formData.append('quality', selectedQuality);
+  const form = new FormData();
+  form.append('image',   imgFile);
+  form.append('audio',   audFile);
+  form.append('quality', selectedQuality);
 
-  document.getElementById('renderBtn').disabled = true;
-  document.getElementById('renderBtn').textContent = '⏳ Uploading…';
+  setBtn(false, '⏳ Uploading…');
 
   try {
-    const res  = await fetch('/render', { method: 'POST', body: formData });
+    const res  = await fetch('/render', { method: 'POST', body: form });
     const data = await res.json();
 
     if (!res.ok || data.error) {
-      showError(data.error || 'Upload failed');
-      resetBtn();
-      return;
+      showError(data.error || 'Upload failed — try again.');
+      resetBtn(); return;
     }
 
     activeJobId = data.job_id;
     renderStart = Date.now();
-    showProgress();
+    showSection('progressSection');
     pollStatus();
 
   } catch (e) {
@@ -757,7 +835,7 @@ async function startRender() {
   }
 }
 
-// ── Poll /status/<job_id> every 1.2s ─────────────
+// ── Poll /status/<id> every 1.4 s ─────────────────────────────────
 async function pollStatus() {
   if (!activeJobId) return;
   try {
@@ -765,93 +843,90 @@ async function pollStatus() {
     const data = await res.json();
     updateProgress(data);
 
-    if (data.status === 'done')  { showDownload(data); return; }
+    if (data.status === 'done')  { onDone(data);        return; }
     if (data.status === 'error') { showError(data.error); return; }
 
-    pollTimer = setTimeout(pollStatus, 1200);
-  } catch (e) {
-    pollTimer = setTimeout(pollStatus, 3000);   // retry on network blip
+    pollTimer = setTimeout(pollStatus, 1400);
+  } catch (_) {
+    pollTimer = setTimeout(pollStatus, 3200);   // retry on fluke
   }
 }
 
-// ── Update progress UI ────────────────────────────
+// ── Progress display ───────────────────────────────────────────────
 function updateProgress(data) {
   const pct = data.progress || 0;
-  document.getElementById('progBar').style.width  = pct + '%';
-  document.getElementById('progPct').textContent  = pct + '%';
+  document.getElementById('progBar').style.width = pct + '%';
+  document.getElementById('progPct').textContent = pct + '%';
 
-  const elapsed = Math.round((Date.now() - renderStart) / 1000);
-  document.getElementById('progElapsed').textContent = fmtTime(elapsed) + ' elapsed';
+  const el = Math.round((Date.now() - renderStart) / 1000);
+  document.getElementById('progElapsed').textContent = fmt(el) + ' elapsed';
+  if (data.eta > 0)
+    document.getElementById('progEta').textContent = 'ETA: ' + fmt(data.eta);
 
-  if (data.eta > 0) {
-    document.getElementById('progEta').textContent = 'ETA: ' + fmtTime(data.eta);
-  }
-
-  const statusMap = {
-    queued:    'Queued — waiting for render slot…',
-    rendering: `Rendering… ${pct}% complete`,
-    done:      'Render complete!',
-    error:     'Render failed.',
+  const map = {
+    queued:    '⏳ Queued — waiting for render slot…',
+    rendering: `⚙️  Encoding video… ${pct}% complete`,
+    done:      '✅ Render complete!',
+    error:     '❌ Render failed.',
   };
-  document.getElementById('progStatus').textContent =
-    statusMap[data.status] || data.status;
+  document.getElementById('progStatus').textContent = map[data.status] || data.status;
 }
 
-// ── Show download ─────────────────────────────────
-function showDownload(data) {
+// ── Done → show download ───────────────────────────────────────────
+function onDone(data) {
   clearTimeout(pollTimer);
-  document.getElementById('progressSection').style.display = 'none';
-  document.getElementById('downloadSection').style.display = 'block';
+  showSection('downloadSection');
 
-  const elapsed = Math.round((Date.now() - renderStart) / 1000);
+  const el = Math.round((Date.now() - renderStart) / 1000);
   document.getElementById('doneMeta').textContent =
-    `${data.file_size || '?'} MB  ·  Rendered in ${fmtTime(elapsed)}`;
+    (data.file_size || '?') + ' MB  ·  Rendered in ' + fmt(el);
 
   const btn = document.getElementById('downloadBtn');
   btn.href     = '/download/' + activeJobId;
   btn.download = 'VideoForge_Output.mp4';
 
-  // Auto-trigger download
-  setTimeout(() => btn.click(), 600);
+  // Auto-trigger browser download after short delay
+  setTimeout(() => btn.click(), 700);
 }
 
-// ── Show error ────────────────────────────────────
+// ── Error display ──────────────────────────────────────────────────
 function showError(msg) {
   clearTimeout(pollTimer);
-  document.getElementById('progressSection').style.display = 'none';
-  document.getElementById('errorSection').style.display    = 'block';
-  document.getElementById('errMsg').textContent = msg || 'Unknown error';
+  showSection('errorSection');
+  document.getElementById('errMsg').textContent = msg || 'Unknown error.';
   resetBtn();
 }
 
-// ── UI state helpers ──────────────────────────────
-function showProgress() {
-  document.getElementById('progressSection').style.display = 'block';
-  document.getElementById('renderBtn').textContent = '⏳ Rendering…';
+// ── UI helpers ─────────────────────────────────────────────────────
+function showSection(id) {
+  ['progressSection','downloadSection','errorSection'].forEach(s => {
+    document.getElementById(s).style.display = s === id ? 'block' : 'none';
+  });
 }
-function resetBtn() {
-  document.getElementById('renderBtn').disabled    = false;
-  document.getElementById('renderBtn').textContent = '⚡ Render Video';
+function setBtn(enabled, label) {
+  const b = document.getElementById('renderBtn');
+  b.disabled = !enabled;
+  b.textContent = label;
 }
+function resetBtn() { setBtn(true, '⚡ Render Video'); }
 function resetUI() {
   clearTimeout(pollTimer);
   activeJobId = null;
+  document.getElementById('progressSection').style.display = 'none';
   document.getElementById('downloadSection').style.display = 'none';
   document.getElementById('errorSection').style.display    = 'none';
-  document.getElementById('progressSection').style.display = 'none';
   document.getElementById('progBar').style.width = '0%';
   document.getElementById('progPct').textContent = '0%';
   resetBtn();
 }
-function fmtTime(s) {
-  if (s < 60) return s + 's';
-  return Math.floor(s/60) + 'm ' + (s%60) + 's';
+function fmt(s) {
+  return s < 60 ? s + 's' : Math.floor(s / 60) + 'm ' + (s % 60) + 's';
 }
 function showToast(msg) {
   const t = document.getElementById('toast');
   t.textContent = msg;
   t.classList.add('show');
-  setTimeout(() => t.classList.remove('show'), 2500);
+  setTimeout(() => t.classList.remove('show'), 2600);
 }
 </script>
 </body>
@@ -859,48 +934,57 @@ function showToast(msg) {
 """
 
 
-# ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 #  FLASK ROUTES
-# ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+
 @app.route("/")
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    return render_template_string(HTML)
 
 
 @app.route("/render", methods=["POST"])
 def render():
-    """Accept files, validate, start background render, return job_id."""
+    """
+    Validates and saves uploaded files, creates a job record,
+    fires a background render thread, returns { job_id }.
+    """
     if "image" not in request.files or "audio" not in request.files:
-        return jsonify({"error": "Image aur audio dono files bhejni hain"}), 400
+        return jsonify({"error": "Both image and audio files are required."}), 400
 
-    img_file  = request.files["image"]
-    aud_file  = request.files["audio"]
-    quality   = request.form.get("quality", "balanced")
+    img_file = request.files["image"]
+    aud_file = request.files["audio"]
+    quality  = request.form.get("quality", "balanced")
 
-    # ── Extension validation ────────────────────────
     img_ext = Path(img_file.filename or "").suffix.lower()
     aud_ext = Path(aud_file.filename or "").suffix.lower()
 
     if img_ext not in ALLOWED_IMAGE_EXT:
-        return jsonify({"error": f"Image format '{img_ext}' support nahi hota. Use: JPG, PNG, WEBP"}), 400
+        return jsonify({
+            "error": f"Unsupported image format '{img_ext}'. Allowed: JPG, PNG, WEBP, BMP"
+        }), 400
+
     if aud_ext not in ALLOWED_AUDIO_EXT:
-        return jsonify({"error": f"Audio format '{aud_ext}' support nahi hota. Use: MP3, WAV, M4A, AAC"}), 400
+        return jsonify({
+            "error": f"Unsupported audio format '{aud_ext}'. Allowed: MP3, WAV, M4A, AAC, OGG, FLAC"
+        }), 400
+
     if quality not in QUALITY_PRESETS:
         quality = "balanced"
 
-    # ── Save to temp dir ────────────────────────────
+    # ── Persist uploads to a per-job temp directory ──────────────
     job_id  = str(uuid.uuid4())[:10]
     job_dir = TEMP_DIR / job_id
     job_dir.mkdir(exist_ok=True)
 
-    img_path = job_dir / f"input{img_ext}"
-    aud_path = job_dir / f"input{aud_ext}"
+    img_path = job_dir / f"src{img_ext}"
+    aud_path = job_dir / f"src{aud_ext}"
     out_path = job_dir / "output.mp4"
 
     img_file.save(img_path)
     aud_file.save(aud_path)
 
-    # ── Create job entry ────────────────────────────
+    # ── Register job ─────────────────────────────────────────────
     jobs[job_id] = {
         "status":      "queued",
         "progress":    0,
@@ -913,20 +997,20 @@ def render():
         "created":     time.time(),
     }
 
-    # ── Fire background thread ──────────────────────
-    thread = threading.Thread(
+    # ── Launch worker ────────────────────────────────────────────
+    threading.Thread(
         target=render_worker,
         args=(job_id, img_path, aud_path, out_path, quality),
         daemon=True,
-    )
-    thread.start()
+        name=f"render-{job_id}",
+    ).start()
 
     return jsonify({"job_id": job_id})
 
 
 @app.route("/status/<job_id>")
 def status(job_id: str):
-    """Return current job status as JSON (polled by frontend)."""
+    """Polled by the frontend every ~1.4 s; returns current job state."""
     job = jobs.get(job_id)
     if not job:
         return jsonify({"error": "Job not found"}), 404
@@ -947,23 +1031,40 @@ def status(job_id: str):
 
 @app.route("/download/<job_id>")
 def download(job_id: str):
-    """Stream the rendered MP4 file to the browser."""
+    """
+    Streams the rendered MP4 to the browser, then schedules
+    deletion of the output file 60 s later to reclaim disk space.
+    """
     job = jobs.get(job_id)
     if not job or job["status"] != "done":
-        return "File abhi ready nahi hai", 404
+        return "File not ready yet.", 404
 
     out_path = Path(job.get("output_path", ""))
     if not out_path.exists():
-        return "File server par nahi mili", 404
+        return "Output file not found on server.", 404
 
     safe_name = f"{job.get('filename', 'video')[:40]}_rendered.mp4"
+
+    # ── Schedule post-download cleanup (60 s grace period) ───────
+    def _delete_after(path: Path, delay: int = 60) -> None:
+        time.sleep(delay)
+        try:
+            path.unlink(missing_ok=True)
+            path.parent.rmdir()         # remove job dir if empty
+        except OSError:
+            pass
+
+    threading.Thread(
+        target=_delete_after, args=(out_path,), daemon=True, name=f"gc-{job_id}"
+    ).start()
+
     return send_file(str(out_path), as_attachment=True, download_name=safe_name)
 
 
-# ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 #  ENTRY POINT
-# ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    print(f"VideoForge starting on http://0.0.0.0:{port}")
+    print(f"[VideoForge] Starting on http://0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
